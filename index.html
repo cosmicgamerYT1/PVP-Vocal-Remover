@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PvP Vocal Remover - AI Source Separation</title>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-analytics-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
 <style>
 :root {
@@ -39,7 +42,6 @@ display: flex;
 flex-direction: column;
 }
 
-/* Animated Background Blobs */
 .bg-blob {
 position: fixed;
 border-radius: 50%;
@@ -57,7 +59,6 @@ animation: float 15s infinite ease-in-out;
 66% { transform: translate(-30px, 40px) scale(0.9); }
 }
 
-/* Header */
 header {
 padding: 20px 40px;
 display: flex;
@@ -118,7 +119,6 @@ animation: pulse 2s infinite;
 100% { opacity: 1; }
 }
 
-/* Main Layout */
 .app-container {
 display: grid;
 grid-template-columns: 320px 1fr;
@@ -126,7 +126,6 @@ flex: 1;
 height: calc(100vh - 81px);
 }
 
-/* Sidebar */
 .sidebar {
 background: rgba(15, 12, 41, 0.4);
 backdrop-filter: blur(20px);
@@ -189,7 +188,6 @@ color: var(--text-secondary);
 .log-entry.warn { color: #ffb74d; }
 .log-entry.error { color: #ff5252; }
 
-/* Main Content */
 .main-content {
 padding: 40px;
 overflow-y: auto;
@@ -198,7 +196,6 @@ flex-direction: column;
 gap: 32px;
 }
 
-/* Upload Zone */
 .upload-zone {
 background: var(--glass-bg);
 border: 2px dashed var(--glass-border);
@@ -247,6 +244,7 @@ display: inline-flex;
 align-items: center;
 gap: 8px;
 font-size: 0.95rem;
+text-decoration: none;
 }
 
 .btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(106, 17, 203, 0.5); }
@@ -257,7 +255,6 @@ font-size: 0.95rem;
 .btn.small { padding: 8px 16px; font-size: 0.85rem; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 
-/* File Info & Player */
 .workspace {
 display: none;
 flex-direction: column;
@@ -339,7 +336,6 @@ transition: var(--transition);
 .progress-bar { flex: 1; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; cursor: pointer; position: relative; overflow: hidden;}
 .progress-fill { height: 100%; background: var(--accent-gradient); width: 0%; transition: width 0.1s linear; }
 
-/* Processing View */
 .processing-view {
 display: none;
 flex-direction: column;
@@ -374,7 +370,6 @@ margin-bottom: 24px;
 .progress-main-fill { height: 100%; background: var(--accent-gradient); width: 0%; transition: width 0.3s ease; box-shadow: 0 0 15px rgba(37, 117, 252, 0.7); }
 .progress-info { display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--text-secondary); }
 
-/* Results/Stems View */
 .stems-grid {
 display: grid;
 grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -419,13 +414,11 @@ opacity: 0.8;
 .stem-controls { display: flex; gap: 8px; }
 .stem-controls .btn { flex: 1; justify-content: center; }
 
-/* Scrollbars */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
 
-/* Responsive */
 @media (max-width: 900px) {
 .app-container { grid-template-columns: 1fr; height: auto; }
 .sidebar { display: none; }
@@ -481,7 +474,6 @@ System Log
 </aside>
 
 <main class="main-content">
-<!-- Upload View -->
 <div id="upload-view" class="upload-zone">
 <div class="upload-icon">
 <svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="url(#grad1)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -500,7 +492,6 @@ Browse Files
 <input type="file" id="file-input" multiple accept="audio/*,video/*">
 </div>
 
-<!-- Workspace View -->
 <div id="workspace" class="workspace">
 <div class="file-card">
 <div class="file-header">
@@ -539,7 +530,6 @@ Reset
 </button>
 </div>
 
-<!-- Processing View -->
 <div id="processing-view" class="processing-view">
 <div class="spinner"></div>
 <div class="processing-text" id="processing-status">Initializing AI Pipeline...</div>
@@ -556,13 +546,28 @@ Reset
 <button class="btn danger small" id="cancel-btn" style="margin-top: 24px;">Cancel</button>
 </div>
 
-<!-- Results View -->
 <div id="results-view" class="stems-grid" style="display: none;"></div>
 </div>
 </main>
 </div>
 
 <script>
+// Firebase Configuration and Initialization
+const firebaseConfig = {
+apiKey: "AIzaSyB7kHB3ec3CYrc2O7MtTTwJ1fHKvY4olMs",
+authDomain: "pvp-vocal-remover.firebaseapp.com",
+databaseURL: "https://pvp-vocal-remover-default-rtdb.europe-west1.firebasedatabase.app",
+projectId: "pvp-vocal-remover",
+storageBucket: "pvp-vocal-remover.firebasestorage.app",
+messagingSenderId: "332090733325",
+appId: "1:332090733325:web:c38da8c8a2be3ce96af644",
+measurementId: "G-GXWBQ5PN0D"
+};
+
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+const analytics = firebase.analytics();
+
 // Utility Classes
 class Logger {
 constructor(containerId) {
@@ -575,6 +580,50 @@ const time = new Date().toLocaleTimeString();
 entry.textContent = `[${time}] ${message}`;
 this.container.appendChild(entry);
 this.container.scrollTop = this.container.scrollHeight;
+}
+}
+
+class FirebaseService {
+constructor(database) {
+this.db = database;
+this.sessionId = null;
+}
+
+startSession(fileName, fileSize) {
+this.sessionId = this.db.ref('processing_sessions').push().key;
+const sessionData = {
+fileName: fileName,
+fileSize: fileSize,
+startTime: firebase.database.ServerValue.TIMESTAMP,
+status: 'INITIALIZED'
+};
+this.db.ref('processing_sessions/' + this.sessionId).set(sessionData);
+return this.sessionId;
+}
+
+updateStatus(status, progress = null) {
+if (!this.sessionId) return;
+const updates = { status: status };
+if (progress !== null) updates.progress = progress;
+this.db.ref('processing_sessions/' + this.sessionId).update(updates);
+}
+
+logError(error) {
+if (!this.sessionId) return;
+this.db.ref('processing_sessions/' + this.sessionId).update({
+status: 'ERROR',
+error: error.message || String(error),
+endTime: firebase.database.ServerValue.TIMESTAMP
+});
+}
+
+endSession(stemsCreated) {
+if (!this.sessionId) return;
+this.db.ref('processing_sessions/' + this.sessionId).update({
+status: 'COMPLETED',
+endTime: firebase.database.ServerValue.TIMESTAMP,
+stemsCreated: stemsCreated
+});
 }
 }
 
@@ -605,7 +654,7 @@ view.setUint16(20, format, true);
 view.setUint16(22, numChannels, true);
 view.setUint32(24, sampleRate, true);
 view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
-view.setUint16(32, numChannels * (bitDepth / 8), true);
+view.setUint16(32, numChannels * (bitDepth /8), true);
 view.setUint16(34, bitDepth, true);
 this.writeString(view, 36, 'data');
 view.setUint32(40, dataLength, true);
@@ -669,7 +718,6 @@ reader.onload = async (e) => {
 try {
 this.logger.log(`Decoding ${file.name}...`, 'info');
 const arrayBuffer = e.target.result;
-// Use standard decodeAudioData. Modern browsers support MP4/M4A/WEBM audio extraction.
 const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
 this.currentBuffer = audioBuffer;
 this.logger.log(`Decoded successfully: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.sampleRate}Hz`, 'success');
@@ -684,15 +732,8 @@ reader.readAsArrayBuffer(file);
 });
 }
 
-// AI-Ready Structure: This method attempts to load a model.
-// If no model is explicitly configured, it falls back to advanced DSP heuristics
-// designed specifically for Minecraft PvP content separation.
 async loadModel() {
 this.logger.log('Checking for AI separation models...', 'info');
-// In a real production environment, we would do:
-// try { this.model = await tf.loadLayersModel('path/to/model.json'); } catch(e) { ... }
-// Since we cannot guarantee external model availability in a standalone file,
-// we utilize our proprietary DSP-matrix engine optimized for PvP frequencies.
 this.logger.log('DSP Matrix Engine initialized (Vocal/Music/SFX frequency bands).', 'success');
 return true;
 }
@@ -705,17 +746,11 @@ this.shouldCancel = false;
 const duration = this.currentBuffer.duration;
 const sampleRate = this.currentBuffer.sampleRate;
 const length = this.currentBuffer.length;
-const channels = this.currentBuffer.numberOfChannels;
 
-// Prepare Offline Context for rendering
 const offlineCtx = new OfflineAudioContext(2, length, sampleRate);
-
-// Source
 const source = offlineCtx.createBufferSource();
 source.buffer = this.currentBuffer;
 
-// Matrix Processing Pipeline
-// 1. Voices: Center channel extraction (L+R / 2) + Bandpass (300Hz - 3400Hz)
 onStatus("Extracting Voices (Center Channel & Vocal Band)", 10);
 if (this.shouldCancel) return;
 const voicesFilter = offlineCtx.createBiquadFilter();
@@ -738,7 +773,6 @@ voicesLP.connect(voicesFilter);
 voicesFilter.connect(voicesMerger, 0, 0);
 voicesFilter.connect(voicesMerger, 0, 1);
 
-// 2. Music: Stereo side information + Low frequencies + High frequency ambiance
 onStatus("Extracting Music (Stereo Width & Bass)", 30);
 if (this.shouldCancel) return;
 const musicLP = offlineCtx.createBiquadFilter();
@@ -756,7 +790,6 @@ source.connect(musicHP);
 musicLP.connect(musicMerger, 0, 0);
 musicHP.connect(musicMerger, 0, 1);
 
-// 3. Minecraft SFX: High frequency transients (Glass, sword hits, blocks)
 onStatus("Extracting Minecraft SFX (High-Freq Transients)", 50);
 if (this.shouldCancel) return;
 const sfxHP = offlineCtx.createBiquadFilter();
@@ -769,16 +802,6 @@ source.connect(sfxHP);
 sfxHP.connect(sfxMerger, 0, 0);
 sfxHP.connect(sfxMerger, 0, 1);
 
-// Render to buffers separately to save memory and isolate
-// Since we can't easily route all to separate outputs in OfflineAudioContext without multiple renders,
-// we do 3 fast renders.
-const stemsConfig = [
-{ name: 'voices', input: voicesMerger, label: 'Voices_Only' },
-{ name: 'music', input: musicMerger, label: 'Music_Only' },
-{ name: 'sfx', input: sfxMerger, label: 'Minecraft_SFX' }
-];
-
-// Connect current stem to destination
 voicesMerger.connect(offlineCtx.destination);
 
 onStatus("Rendering Audio Stems...", 70);
@@ -786,7 +809,6 @@ if (this.shouldCancel) return;
 const renderedBuffer = await offlineCtx.startRendering();
 this.stems.voices = renderedBuffer;
 
-// Render Music
 const offlineCtx2 = new OfflineAudioContext(2, length, sampleRate);
 const source2 = offlineCtx2.createBufferSource();
 source2.buffer = this.currentBuffer;
@@ -800,7 +822,6 @@ onStatus("Rendering Music Stem...", 80);
 if (this.shouldCancel) return;
 this.stems.music = await offlineCtx2.startRendering();
 
-// Render SFX
 const offlineCtx3 = new OfflineAudioContext(2, length, sampleRate);
 const source3 = offlineCtx3.createBufferSource();
 source3.buffer = this.currentBuffer;
@@ -827,6 +848,7 @@ this.isProcessing = false;
 class UIController {
 constructor() {
 this.logger = new Logger('log-container');
+this.firebase = new FirebaseService(db);
 this.pipeline = new AudioPipeline(this.logger);
 this.currentFile = null;
 this.audioElements = {};
@@ -836,6 +858,7 @@ this.initElements();
 this.bindEvents();
 this.initKeyboardShortcuts();
 this.logger.log('Application initialized. Ready for files.', 'success');
+this.logger.log('Connected to Firebase Realtime Database.', 'success');
 }
 
 initElements() {
@@ -912,10 +935,8 @@ async handleFiles(fileList) {
 const files = Array.from(fileList);
 if (files.length === 0) return;
 
-// Update Batch Queue UI
 this.updateBatchQueue(files);
 
-// Process the first file immediately
 this.currentFile = files[0];
 this.logger.log(`File selected: ${this.currentFile.name}`, 'info');
 
@@ -928,6 +949,9 @@ this.fileMeta.innerHTML = `
 `;
 
 try {
+this.firebase.startSession(this.currentFile.name, this.currentFile.size);
+this.logger.log('Session logged to Firebase.', 'info');
+
 const audioBuffer = await this.pipeline.decodeFile(this.currentFile);
 this.totalDurationEl.textContent = this.formatTime(audioBuffer.duration);
 this.fileMeta.innerHTML += `
@@ -940,6 +964,7 @@ this.prepareOriginalAudio(audioBuffer);
 } catch (err) {
 this.showToast(err.message, 'error');
 this.logger.log(err.message, 'error');
+this.firebase.logError(err);
 }
 }
 
@@ -954,7 +979,6 @@ this.batchQueue.appendChild(item);
 }
 
 prepareOriginalAudio(buffer) {
-// Create a playable source
 const blob = WAVEncoder.encode(buffer);
 const url = URL.createObjectURL(blob);
 this.audioElements.original = new Audio(url);
@@ -992,7 +1016,6 @@ ctx.lineTo(i, (1 + max) * amp);
 }
 ctx.stroke();
 
-// Add gradient overlay
 const gradient = ctx.createLinearGradient(0, 0, width, 0);
 gradient.addColorStop(0, 'rgba(106, 17, 203, 0.4)');
 gradient.addColorStop(1, 'rgba(37, 117, 252, 0.4)');
@@ -1005,7 +1028,6 @@ const audio = this.audioElements[type];
 if (!audio) return;
 
 if (audio.paused) {
-// Pause all others
 Object.values(this.audioElements).forEach(a => { if(a !== audio) a.pause(); });
 audio.play();
 if (type === 'original') {
@@ -1047,6 +1069,7 @@ this.processingView.classList.add('active');
 this.processBtn.disabled = true;
 
 try {
+this.firebase.updateStatus('PROCESSING', 0);
 await this.pipeline.loadModel();
 const startTime = Date.now();
 
@@ -1057,16 +1080,19 @@ const stems = await this.pipeline.processStems(
 
 if (this.pipeline.shouldCancel) {
 this.logger.log('Processing cancelled by user.', 'warn');
+this.firebase.updateStatus('CANCELLED', 0);
 this.resetProcessingUI();
 return;
 }
 
 this.displayStems(stems);
 this.logger.log('Stem separation completed successfully!', 'success');
+this.firebase.endSession(['voices', 'music', 'sfx']);
 
 } catch (err) {
 this.logger.log(`Processing error: ${err.message}`, 'error');
 this.showToast(err.message, 'error');
+this.firebase.logError(err);
 this.resetProcessingUI();
 }
 }
@@ -1075,6 +1101,8 @@ updateStatusUI(status, progress, startTime) {
 this.processingStatus.textContent = status;
 this.mainProgress.style.width = `${progress}%`;
 this.progressPercent.textContent = `${progress}%`;
+
+this.firebase.updateStatus(status, progress);
 
 if (progress > 0) {
 const elapsed = (Date.now() - startTime) / 1000;
@@ -1093,6 +1121,7 @@ this.progressPercent.textContent = `${Math.round(progress)}%`;
 
 cancelProcessing() {
 this.pipeline.cancel();
+this.firebase.updateStatus('CANCELLED', 0);
 this.resetProcessingUI();
 }
 
@@ -1143,17 +1172,14 @@ Download
 `;
 this.resultsView.appendChild(card);
 
-// Draw stem waveform
 setTimeout(() => {
 const canvas = document.getElementById(`wave-${cfg.key}`);
 this.drawWaveform(buffer, canvas);
 }, 100);
 
-// Bind play button
 card.querySelector('[data-play]').addEventListener('click', (e) => {
 const key = e.currentTarget.dataset.play;
 this.togglePlay(key);
-// Simple toggle visual
 const isPlaying = !this.audioElements[key].paused;
 e.currentTarget.innerHTML = isPlaying ?
 `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg> Pause` :
@@ -1163,15 +1189,12 @@ e.currentTarget.innerHTML = isPlaying ?
 }
 
 resetWorkspace() {
-// Stop all audio
 Object.values(this.audioElements).forEach(a => { if(a) { a.pause(); a.src = ''; } });
 this.audioElements = {};
 
-// Reset pipeline
 this.pipeline.currentBuffer = null;
 this.pipeline.stems = {};
 
-// Reset UI
 this.workspace.classList.remove('active');
 this.uploadZone.style.display = 'block';
 this.processingView.classList.remove('active');
@@ -1205,7 +1228,6 @@ setTimeout(() => toast.remove(), 4000);
 }
 }
 
-// Initialize App
 document.addEventListener('DOMContentLoaded', () => {
 window.app = new UIController();
 });
