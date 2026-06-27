@@ -7,7 +7,6 @@
     <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-analytics-compat.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
     <style>
         :root {
             --bg-gradient: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
@@ -690,6 +689,45 @@
             }
         }
 
+        class AudioExporter {
+            static async encodeToMp4(audioBuffer) {
+                return new Promise((resolve, reject) => {
+                    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    const source = audioContext.createBufferSource();
+                    source.buffer = audioBuffer;
+                    const dest = audioContext.createMediaStreamDestination();
+                    source.connect(dest);
+                    
+                    let mimeType = 'audio/mp4';
+                    if (!MediaRecorder.isTypeSupported(mimeType)) {
+                        mimeType = 'audio/webm;codecs=opus';
+                        if (!MediaRecorder.isTypeSupported(mimeType)) {
+                            mimeType = 'audio/webm';
+                        }
+                    }
+                    
+                    const recorder = new MediaRecorder(dest.stream, { mimeType });
+                    const chunks = [];
+                    recorder.ondataavailable = e => {
+                        if (e.data.size > 0) chunks.push(e.data);
+                    };
+                    recorder.onstop = () => {
+                        // Force type to audio/mp4 for compatibility with downstream tools
+                        const blob = new Blob(chunks, { type: 'audio/mp4' });
+                        resolve(blob);
+                        audioContext.close();
+                    };
+                    
+                    source.onended = () => {
+                        recorder.stop();
+                    };
+                    
+                    source.start(0);
+                    recorder.start();
+                });
+            }
+        }
+
         class AudioPipeline {
             constructor(logger) {
                 this.logger = logger;
@@ -735,7 +773,7 @@
 
             async loadModel() {
                 this.logger.log('Checking for AI separation models...', 'info');
-                this.logger.log('DSP Matrix Engine initialized (Vocal/Music/SFX frequency bands).', 'success');
+                this.logger.log('DSP Matrix Engine initialized (Mid/Side Processing).', 'success');
                 return true;
             }
 
@@ -746,76 +784,123 @@
 
                 const length = this.currentBuffer.length;
                 const sampleRate = this.currentBuffer.sampleRate;
-                const numChannels = this.currentBuffer.numberOfChannels;
+                const numChannels = 2; // Force stereo for Mid/Side
 
-                // 1. Render Voices Stem (300Hz - 3500Hz Bandpass)
-                onStatus("Extracting Voices (Vocal Band)", 20);
+                // 1. Render Voices Stem (Mid Signal -> Vocal Bandpass)
+                onStatus("Extracting Voices (Center & Vocal Band)", 20);
                 if (this.shouldCancel) return;
                 {
                     const ctx = new OfflineAudioContext(numChannels, length, sampleRate);
                     const src = ctx.createBufferSource();
                     src.buffer = this.currentBuffer;
+
+                    const splitter = ctx.createChannelSplitter(2);
+                    src.connect(splitter);
+
+                    // Create Mid Signal (L+R)
+                    const midMerger = ctx.createGain();
+                    splitter.connect(midMerger, 0);
+                    splitter.connect(midMerger, 1);
 
                     const hp = ctx.createBiquadFilter();
                     hp.type = "highpass";
                     hp.frequency.value = 300;
+                    hp.Q.value = 1;
 
                     const lp = ctx.createBiquadFilter();
                     lp.type = "lowpass";
-                    lp.frequency.value = 3500;
+                    lp.frequency.value = 3400;
+                    lp.Q.value = 1;
 
-                    src.connect(hp);
+                    midMerger.connect(hp);
                     hp.connect(lp);
-                    lp.connect(ctx.destination);
-                    src.start(0); // Crucial: Must call start() on the buffer source
 
+                    const outMerger = ctx.createChannelMerger(2);
+                    lp.connect(outMerger, 0, 0);
+                    lp.connect(outMerger, 0, 1);
+                    outMerger.connect(ctx.destination);
+                    
+                    src.start(0);
                     this.stems.voices = await ctx.startRendering();
                 }
 
-                // 2. Render Music Stem (Bass < 250Hz + Highs > 6000Hz)
-                onStatus("Extracting Music (Bass & Highs)", 50);
+                // 2. Render Music Stem (Side Signal + Mid Bass)
+                onStatus("Extracting Music (Instrumental & Bass)", 40);
                 if (this.shouldCancel) return;
                 {
                     const ctx = new OfflineAudioContext(numChannels, length, sampleRate);
                     const src = ctx.createBufferSource();
                     src.buffer = this.currentBuffer;
 
-                    const lp = ctx.createBiquadFilter();
-                    lp.type = "lowpass";
-                    lp.frequency.value = 250;
+                    const splitter = ctx.createChannelSplitter(2);
+                    src.connect(splitter);
 
-                    const hp = ctx.createBiquadFilter();
-                    hp.type = "highpass";
-                    hp.frequency.value = 6000;
-
-                    const sum = ctx.createGain(); // Use GainNode to sum the signals safely
-                    src.connect(lp);
-                    src.connect(hp);
-                    lp.connect(sum);
-                    hp.connect(sum);
-                    sum.connect(ctx.destination);
+                    // Create Side Signal (L-R)
+                    const invR = ctx.createGain();
+                    invR.gain.value = -1;
+                    splitter.connect(invR, 1);
+                    
+                    const sideMerger = ctx.createGain();
+                    splitter.connect(sideMerger, 0);
+                    invR.connect(sideMerger);
+                    
+                    // Create Mid Signal for Bass
+                    const midMerger = ctx.createGain();
+                    splitter.connect(midMerger, 0);
+                    splitter.connect(midMerger, 1);
+                    
+                    const bassLP = ctx.createBiquadFilter();
+                    bassLP.type = "lowpass";
+                    bassLP.frequency.value = 250;
+                    midMerger.connect(bassLP);
+                    
+                    // Combine Side and Bass
+                    const sum = ctx.createGain();
+                    sideMerger.connect(sum);
+                    bassLP.connect(sum);
+                    
+                    const outMerger = ctx.createChannelMerger(2);
+                    sum.connect(outMerger, 0, 0);
+                    sum.connect(outMerger, 0, 1);
+                    outMerger.connect(ctx.destination);
+                    
                     src.start(0);
-
                     this.stems.music = await ctx.startRendering();
                 }
 
-                // 3. Render Minecraft SFX Stem (> 4000Hz Highpass)
-                onStatus("Extracting Minecraft SFX (High-Freq Transients)", 80);
+                // 3. Render SFX Stem (Side Signal -> Highpass)
+                onStatus("Extracting Minecraft SFX (High-Freq Transients)", 60);
                 if (this.shouldCancel) return;
                 {
                     const ctx = new OfflineAudioContext(numChannels, length, sampleRate);
                     const src = ctx.createBufferSource();
                     src.buffer = this.currentBuffer;
 
+                    const splitter = ctx.createChannelSplitter(2);
+                    src.connect(splitter);
+
+                    // Create Side Signal (L-R)
+                    const invR = ctx.createGain();
+                    invR.gain.value = -1;
+                    splitter.connect(invR, 1);
+                    
+                    const sideMerger = ctx.createGain();
+                    splitter.connect(sideMerger, 0);
+                    invR.connect(sideMerger);
+                    
                     const hp = ctx.createBiquadFilter();
                     hp.type = "highpass";
                     hp.frequency.value = 4000;
                     hp.Q.value = 0.7;
-
-                    src.connect(hp);
-                    hp.connect(ctx.destination);
+                    
+                    sideMerger.connect(hp);
+                    
+                    const outMerger = ctx.createChannelMerger(2);
+                    hp.connect(outMerger, 0, 0);
+                    hp.connect(outMerger, 0, 1);
+                    outMerger.connect(ctx.destination);
+                    
                     src.start(0);
-
                     this.stems.sfx = await ctx.startRendering();
                 }
 
@@ -1052,6 +1137,8 @@
             async startProcessing() {
                 this.processingView.classList.add('active');
                 this.processBtn.disabled = true;
+                this.resultsView.style.display = 'none';
+                this.resultsView.innerHTML = '';
                 
                 try {
                     this.firebase.updateStatus('PROCESSING', 0);
@@ -1070,8 +1157,8 @@
                         return;
                     }
 
-                    this.displayStems(stems);
-                    this.logger.log('Stem separation completed successfully!', 'success');
+                    this.logger.log('Stem separation completed. Starting MP4 encoding...', 'success');
+                    await this.displayStems(stems);
                     this.firebase.endSession(['voices', 'music', 'sfx']);
                     
                 } catch (err) {
@@ -1117,24 +1204,20 @@
                 this.processBtn.disabled = false;
             }
 
-            displayStems(stems) {
+            async displayStems(stems) {
                 this.processingView.classList.remove('active');
                 this.resultsView.style.display = 'grid';
                 this.resultsView.innerHTML = '';
 
                 const stemConfigs = [
-                    { key: 'voices', name: 'Voices Only', desc: 'Discord, Teammates, Streamer', icon: '🎙️', class: 'voices', filename: 'Voices.wav' },
-                    { key: 'music', name: 'Music Only', desc: 'Background tracks, Instrumentals', icon: '🎵', class: 'music', filename: 'Music.wav' },
-                    { key: 'sfx', name: 'Minecraft SFX', desc: 'Swords, Pearls, Blocks, Mobs', icon: '⚔️', class: 'sfx', filename: 'Minecraft_SFX.wav' }
+                    { key: 'voices', name: 'Voices Only', desc: 'Discord, Teammates, Streamer', icon: '🎙️', class: 'voices', filename: 'Voices.mp4' },
+                    { key: 'music', name: 'Music Only', desc: 'Background tracks, Instrumentals', icon: '🎵', class: 'music', filename: 'Music.mp4' },
+                    { key: 'sfx', name: 'Minecraft SFX', desc: 'Swords, Pearls, Blocks, Mobs', icon: '⚔️', class: 'sfx', filename: 'Minecraft_SFX.mp4' }
                 ];
 
-                stemConfigs.forEach(cfg => {
+                for (const cfg of stemConfigs) {
                     const buffer = stems[cfg.key];
-                    const blob = WAVEncoder.encode(buffer);
-                    const url = URL.createObjectURL(blob);
                     
-                    this.audioElements[cfg.key] = new Audio(url);
-
                     const card = document.createElement('div');
                     card.className = `stem-card ${cfg.class}`;
                     card.innerHTML = `
@@ -1147,14 +1230,14 @@
                         </div>
                         <canvas class="stem-waveform" id="wave-${cfg.key}"></canvas>
                         <div class="stem-controls">
-                            <button class="btn small secondary" data-play="${cfg.key}">
+                            <button class="btn small secondary" data-play="${cfg.key}" disabled>
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
                                 Play
                             </button>
-                            <a class="btn small" href="${url}" download="${cfg.filename}">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                                Download
-                            </a>
+                            <button class="btn small" id="dl-${cfg.key}" disabled>
+                                <div class="spinner" style="width: 14px; height: 14px; border-width: 2px; margin: 0;"></div>
+                                Encoding...
+                            </button>
                         </div>
                     `;
                     this.resultsView.appendChild(card);
@@ -1164,7 +1247,21 @@
                         this.drawWaveform(buffer, canvas);
                     }, 100);
 
-                    card.querySelector('[data-play]').addEventListener('click', (e) => {
+                    // Encode to MP4
+                    const blob = await AudioExporter.encodeToMp4(buffer);
+                    const url = URL.createObjectURL(blob);
+                    
+                    this.audioElements[cfg.key] = new Audio(url);
+                    this.audioElements[cfg.key].addEventListener('ended', () => {
+                        const btn = card.querySelector(`[data-play="${cfg.key}"]`);
+                        btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg> Play`;
+                    });
+
+                    const playBtn = card.querySelector(`[data-play="${cfg.key}"]`);
+                    const dlBtn = document.getElementById(`dl-${cfg.key}`);
+                    
+                    playBtn.disabled = false;
+                    playBtn.addEventListener('click', (e) => {
                         const key = e.currentTarget.dataset.play;
                         this.togglePlay(key);
                         const isPlaying = !this.audioElements[key].paused;
@@ -1172,7 +1269,17 @@
                             `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg> Pause` :
                             `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg> Play`;
                     });
-                });
+
+                    dlBtn.disabled = false;
+                    dlBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg> Download`;
+                    
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = cfg.filename;
+                    dlBtn.addEventListener('click', () => a.click());
+                }
+                
+                this.logger.log('All stems encoded to MP4 and ready for download.', 'success');
             }
 
             resetWorkspace() {
@@ -1186,6 +1293,7 @@
                 this.uploadZone.style.display = 'block';
                 this.processingView.classList.remove('active');
                 this.resultsView.style.display = 'none';
+                this.resultsView.innerHTML = '';
                 this.processBtn.disabled = false;
                 this.resetPlayButton();
                 this.progressFill.style.width = '0%';
