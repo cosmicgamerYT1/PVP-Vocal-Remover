@@ -706,13 +706,18 @@
                         }
                     }
                     
-                    const recorder = new MediaRecorder(dest.stream, { mimeType });
+                    // Set high bitrate to preserve quality identical to original
+                    const options = {
+                        mimeType: mimeType,
+                        audioBitsPerSecond: 384000 // High quality 384kbps
+                    };
+                    
+                    const recorder = new MediaRecorder(dest.stream, options);
                     const chunks = [];
                     recorder.ondataavailable = e => {
                         if (e.data.size > 0) chunks.push(e.data);
                     };
                     recorder.onstop = () => {
-                        // Force type to audio/mp4 for compatibility with downstream tools
                         const blob = new Blob(chunks, { type: 'audio/mp4' });
                         resolve(blob);
                         audioContext.close();
@@ -824,7 +829,7 @@
                     this.stems.voices = await ctx.startRendering();
                 }
 
-                // 2. Render Music Stem (Side Signal + Mid Bass)
+                // 2. Render Music Stem (Instrumental)
                 onStatus("Extracting Music (Instrumental & Bass)", 40);
                 if (this.shouldCancel) return;
                 {
@@ -835,29 +840,42 @@
                     const splitter = ctx.createChannelSplitter(2);
                     src.connect(splitter);
 
-                    // Create Side Signal (L-R)
+                    // --- SIDE SIGNAL (L-R) ---
+                    // Keeps all stereo instruments and stereo reverb. Boosted to compensate for missing Mid.
                     const invR = ctx.createGain();
                     invR.gain.value = -1;
                     splitter.connect(invR, 1);
                     
                     const sideMerger = ctx.createGain();
+                    sideMerger.gain.value = 1.5; // Boost Side signal
                     splitter.connect(sideMerger, 0);
                     invR.connect(sideMerger);
                     
-                    // Create Mid Signal for Bass
+                    // --- MID SIGNAL (L+R) ---
+                    // Keeps center bass and center highs, completely removes center vocals (200Hz - 4000Hz)
                     const midMerger = ctx.createGain();
                     splitter.connect(midMerger, 0);
                     splitter.connect(midMerger, 1);
                     
-                    const bassLP = ctx.createBiquadFilter();
-                    bassLP.type = "lowpass";
-                    bassLP.frequency.value = 250;
-                    midMerger.connect(bassLP);
+                    // Keep < 200Hz from Mid (Bass, Kick Drums)
+                    const midBassLP = ctx.createBiquadFilter();
+                    midBassLP.type = "lowpass";
+                    midBassLP.frequency.value = 200;
+                    midBassLP.Q.value = 0.7;
+                    midMerger.connect(midBassLP);
                     
-                    // Combine Side and Bass
+                    // Keep > 4000Hz from Mid (High-hats, Cymbals, Snares)
+                    const midHighsHP = ctx.createBiquadFilter();
+                    midHighsHP.type = "highpass";
+                    midHighsHP.frequency.value = 4000;
+                    midHighsHP.Q.value = 0.7;
+                    midMerger.connect(midHighsHP);
+                    
+                    // Combine Side + Mid Bass + Mid Highs
                     const sum = ctx.createGain();
                     sideMerger.connect(sum);
-                    bassLP.connect(sum);
+                    midBassLP.connect(sum);
+                    midHighsHP.connect(sum);
                     
                     const outMerger = ctx.createChannelMerger(2);
                     sum.connect(outMerger, 0, 0);
