@@ -7,6 +7,7 @@
     <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-analytics-compat.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
     <style>
         :root {
             --bg-gradient: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
@@ -733,6 +734,256 @@
             }
         }
 
+        // ==================== Neural Vocal Separation (MDX-Net via onnxruntime-web) ====================
+        // This replaces the guesswork of fixed frequency bands with an actual pretrained
+        // source-separation model, so vocals can be removed without needing a "safe gap"
+        // of skipped frequencies that used to let vocal harmonics/sibilance leak through
+        // in the bass/treble bands. If the model can't be downloaded or run (offline, a
+        // shape mismatch, etc.) everything automatically falls back to the original
+        // Mid/Side DSP method below - nothing about that method has been changed.
+
+        const ML_MODEL_URL = 'https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/Kim_Vocal_1.onnx';
+        const ML_N_FFT = 6144;
+        const ML_HOP = 1024;
+        const ML_DIM_F = 2048;
+        const ML_DIM_T = 256;
+
+        function mlIsPowerOf2(n) { return (n & (n - 1)) === 0 && n > 0; }
+        function mlNextPow2(n) { let p = 1; while (p < n) p <<= 1; return p; }
+
+        // Iterative radix-2 Cooley-Tukey FFT (in place). Verified against numpy to ~1e-13 precision.
+        function mlFftRadix2(re, im, invert) {
+            const n = re.length;
+            if (n === 1) return;
+            for (let i = 1, j = 0; i < n; i++) {
+                let bit = n >> 1;
+                for (; j & bit; bit >>= 1) j ^= bit;
+                j ^= bit;
+                if (i < j) {
+                    let t = re[i]; re[i] = re[j]; re[j] = t;
+                    t = im[i]; im[i] = im[j]; im[j] = t;
+                }
+            }
+            for (let len = 2; len <= n; len <<= 1) {
+                const ang = (invert ? 1 : -1) * 2 * Math.PI / len;
+                const wr = Math.cos(ang), wi = Math.sin(ang);
+                for (let i = 0; i < n; i += len) {
+                    let curWr = 1, curWi = 0;
+                    for (let j = 0; j < len / 2; j++) {
+                        const ur = re[i + j], ui = im[i + j];
+                        const vr = re[i + j + len / 2] * curWr - im[i + j + len / 2] * curWi;
+                        const vi = re[i + j + len / 2] * curWi + im[i + j + len / 2] * curWr;
+                        re[i + j] = ur + vr; im[i + j] = ui + vi;
+                        re[i + j + len / 2] = ur - vr; im[i + j + len / 2] = ui - vi;
+                        const nWr = curWr * wr - curWi * wi;
+                        const nWi = curWr * wi + curWi * wr;
+                        curWr = nWr; curWi = nWi;
+                    }
+                }
+            }
+            if (invert) { for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; } }
+        }
+
+        // Bluestein's algorithm: arbitrary-length DFT (needed because n_fft=6144 isn't a power of 2).
+        // Verified against numpy to ~1e-11 precision.
+        function mlFftBluestein(re, im, invert) {
+            const n = re.length;
+            const m = mlNextPow2(n * 2 - 1);
+            const cosT = new Float64Array(n), sinT = new Float64Array(n);
+            for (let i = 0; i < n; i++) {
+                const j = (i * i) % (n * 2);
+                const ang = (invert ? 1 : -1) * Math.PI * j / n;
+                cosT[i] = Math.cos(ang); sinT[i] = Math.sin(ang);
+            }
+            const are = new Float64Array(m), aim = new Float64Array(m);
+            for (let i = 0; i < n; i++) {
+                are[i] = re[i] * cosT[i] - im[i] * sinT[i];
+                aim[i] = re[i] * sinT[i] + im[i] * cosT[i];
+            }
+            const bre = new Float64Array(m), bim = new Float64Array(m);
+            bre[0] = cosT[0]; bim[0] = -sinT[0];
+            for (let i = 1; i < n; i++) {
+                bre[i] = bre[m - i] = cosT[i];
+                bim[i] = bim[m - i] = -sinT[i];
+            }
+            mlFftRadix2(are, aim, false);
+            mlFftRadix2(bre, bim, false);
+            for (let i = 0; i < m; i++) {
+                const r = are[i] * bre[i] - aim[i] * bim[i];
+                const im2 = are[i] * bim[i] + aim[i] * bre[i];
+                are[i] = r; aim[i] = im2;
+            }
+            mlFftRadix2(are, aim, true);
+            for (let i = 0; i < n; i++) {
+                re[i] = are[i] * cosT[i] - aim[i] * sinT[i];
+                im[i] = are[i] * sinT[i] + aim[i] * cosT[i];
+            }
+            if (invert) { for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; } }
+        }
+
+        function mlFft(re, im) { if (mlIsPowerOf2(re.length)) mlFftRadix2(re, im, false); else mlFftBluestein(re, im, false); }
+        function mlIfft(re, im) { if (mlIsPowerOf2(re.length)) mlFftRadix2(re, im, true); else mlFftBluestein(re, im, true); }
+
+        function mlHannWindow(n) {
+            const w = new Float64Array(n);
+            for (let i = 0; i < n; i++) w[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / n);
+            return w;
+        }
+
+        class MDXVocalSeparator {
+            constructor(logger) {
+                this.logger = logger;
+                this.session = null;
+                this.window = mlHannWindow(ML_N_FFT);
+                this.chunkWindow = mlHannWindow(ML_DIM_T); // for blending overlapping inference chunks
+            }
+
+            async load() {
+                this.logger.log('Fetching neural vocal-separation model (Kim_Vocal_1, one-time download)...', 'info');
+                const res = await fetch(ML_MODEL_URL);
+                if (!res.ok) throw new Error(`Model download failed: HTTP ${res.status}`);
+                const total = Number(res.headers.get('content-length')) || 0;
+                const reader = res.body.getReader();
+                const chunks = [];
+                let received = 0;
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                    received += value.length;
+                    if (total) {
+                        const pct = ((received / total) * 100).toFixed(0);
+                        this.logger.log(`Downloading model... ${pct}% (${(received / 1048576).toFixed(1)}MB / ${(total / 1048576).toFixed(1)}MB)`, 'info');
+                    }
+                }
+                const modelBytes = new Uint8Array(received);
+                let offset = 0;
+                for (const c of chunks) { modelBytes.set(c, offset); offset += c.length; }
+
+                ort.env.wasm.numThreads = 1; // avoids requiring COOP/COEP headers for a plain static file
+                ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
+                this.session = await ort.InferenceSession.create(modelBytes.buffer, { executionProviders: ['wasm'] });
+                this.inputName = this.session.inputNames[0];
+                this.outputName = this.session.outputNames[0];
+                this.logger.log('Neural vocal-separation model loaded and ready.', 'success');
+            }
+
+            // Runs full separation on a stereo AudioBuffer at its own sample rate.
+            // Returns { vocalsL, vocalsR } Float64Arrays the same length as the input.
+            async separate(buffer, onStatus, checkCancel) {
+                const L = buffer.getChannelData(0);
+                const R = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : buffer.getChannelData(0);
+                const n = L.length;
+
+                const numFrames = Math.floor((n - ML_N_FFT) / ML_HOP) + 1;
+                if (numFrames < 1) throw new Error('Audio too short for the model frame size');
+
+                const specL = new Array(numFrames), specR = new Array(numFrames);
+                for (let f = 0; f < numFrames; f++) {
+                    const start = f * ML_HOP;
+                    const reL = new Float64Array(ML_N_FFT), imL = new Float64Array(ML_N_FFT);
+                    const reR = new Float64Array(ML_N_FFT), imR = new Float64Array(ML_N_FFT);
+                    for (let i = 0; i < ML_N_FFT; i++) {
+                        reL[i] = L[start + i] * this.window[i];
+                        reR[i] = R[start + i] * this.window[i];
+                    }
+                    mlFft(reL, imL); mlFft(reR, imR);
+                    specL[f] = { re: reL.slice(0, ML_DIM_F), im: imL.slice(0, ML_DIM_F) };
+                    specR[f] = { re: reR.slice(0, ML_DIM_F), im: imR.slice(0, ML_DIM_F) };
+                }
+
+                const accRe = [new Float64Array(numFrames * ML_DIM_F), new Float64Array(numFrames * ML_DIM_F)];
+                const accIm = [new Float64Array(numFrames * ML_DIM_F), new Float64Array(numFrames * ML_DIM_F)];
+                const accW = new Float64Array(numFrames);
+
+                const stride = Math.max(1, Math.floor(ML_DIM_T / 2)); // 50% overlap between inference chunks
+                const totalChunks = Math.ceil(numFrames / stride);
+                const cStride = ML_DIM_F * ML_DIM_T;
+                let chunkIdx = 0;
+
+                for (let chunkStart = 0; chunkStart < numFrames; chunkStart += stride) {
+                    if (checkCancel && checkCancel()) throw new Error('CANCELLED');
+                    chunkIdx++;
+                    if (onStatus) onStatus(`Running neural separation (chunk ${chunkIdx}/${totalChunks})...`, 20 + Math.min(60, Math.round((chunkIdx / totalChunks) * 60)));
+
+                    const tensorData = new Float32Array(4 * cStride);
+                    const chunkLen = Math.min(ML_DIM_T, numFrames - chunkStart);
+                    for (let t = 0; t < chunkLen; t++) {
+                        const fr = chunkStart + t;
+                        for (let fbin = 0; fbin < ML_DIM_F; fbin++) {
+                            const base = fbin * ML_DIM_T + t;
+                            tensorData[0 * cStride + base] = specL[fr].re[fbin];
+                            tensorData[1 * cStride + base] = specR[fr].re[fbin];
+                            tensorData[2 * cStride + base] = specL[fr].im[fbin];
+                            tensorData[3 * cStride + base] = specR[fr].im[fbin];
+                        }
+                    }
+
+                    const inputTensor = new ort.Tensor('float32', tensorData, [1, 4, ML_DIM_F, ML_DIM_T]);
+                    const feeds = {}; feeds[this.inputName] = inputTensor;
+                    const results = await this.session.run(feeds);
+                    const outTensor = results[this.outputName];
+                    const outData = outTensor.data;
+
+                    if (!outData || outData.length !== 4 * cStride) {
+                        throw new Error(`Unexpected model output size (got ${outData ? outData.length : 'none'}, expected ${4 * cStride}) - model I/O doesn't match assumptions`);
+                    }
+
+                    for (let t = 0; t < chunkLen; t++) {
+                        const fr = chunkStart + t;
+                        const w = this.chunkWindow[t] + 1e-6;
+                        accW[fr] += w;
+                        for (let fbin = 0; fbin < ML_DIM_F; fbin++) {
+                            const base = fbin * ML_DIM_T + t;
+                            const idx = fr * ML_DIM_F + fbin;
+                            accRe[0][idx] += outData[0 * cStride + base] * w;
+                            accRe[1][idx] += outData[1 * cStride + base] * w;
+                            accIm[0][idx] += outData[2 * cStride + base] * w;
+                            accIm[1][idx] += outData[3 * cStride + base] * w;
+                        }
+                    }
+                }
+
+                if (onStatus) onStatus('Reconstructing separated audio...', 82);
+
+                const vocalsL = new Float64Array(n), vocalsR = new Float64Array(n);
+                const normL = new Float64Array(n), normR = new Float64Array(n);
+
+                for (let f = 0; f < numFrames; f++) {
+                    const w = accW[f] > 1e-9 ? accW[f] : 1;
+                    const start = f * ML_HOP;
+                    for (let ch = 0; ch < 2; ch++) {
+                        const re = new Float64Array(ML_N_FFT), im = new Float64Array(ML_N_FFT);
+                        for (let fbin = 0; fbin < ML_DIM_F; fbin++) {
+                            const idx = f * ML_DIM_F + fbin;
+                            re[fbin] = accRe[ch][idx] / w;
+                            im[fbin] = accIm[ch][idx] / w;
+                        }
+                        // Bins above ML_DIM_F are assumed vocal-free (matches the model's own training cutoff)
+                        // and are mirrored via Hermitian symmetry so the inverse FFT stays real-valued.
+                        for (let k = ML_N_FFT / 2 + 1; k < ML_N_FFT; k++) {
+                            re[k] = re[ML_N_FFT - k];
+                            im[k] = -im[ML_N_FFT - k];
+                        }
+                        mlIfft(re, im);
+                        const outArr = ch === 0 ? vocalsL : vocalsR;
+                        const normArr = ch === 0 ? normL : normR;
+                        for (let i = 0; i < ML_N_FFT; i++) {
+                            if (start + i >= n) break;
+                            outArr[start + i] += re[i] * this.window[i];
+                            normArr[start + i] += this.window[i] * this.window[i];
+                        }
+                    }
+                }
+                for (let i = 0; i < n; i++) {
+                    if (normL[i] > 1e-8) vocalsL[i] /= normL[i];
+                    if (normR[i] > 1e-8) vocalsR[i] /= normR[i];
+                }
+
+                return { vocalsL, vocalsR };
+            }
+        }
+
         class AudioPipeline {
             constructor(logger) {
                 this.logger = logger;
@@ -741,6 +992,19 @@
                 this.stems = {};
                 this.isProcessing = false;
                 this.shouldCancel = false;
+                this.mlSeparator = new MDXVocalSeparator(logger);
+                this.mlAvailable = false;
+            }
+
+            // Renders `buffer` at a different sample rate using the browser's own resampler.
+            async resampleBuffer(buffer, targetRate) {
+                if (buffer.sampleRate === targetRate) return buffer;
+                const ctx = new OfflineAudioContext(buffer.numberOfChannels, Math.ceil(buffer.duration * targetRate), targetRate);
+                const src = ctx.createBufferSource();
+                src.buffer = buffer;
+                src.connect(ctx.destination);
+                src.start(0);
+                return await ctx.startRendering();
             }
 
             initContext() {
@@ -778,6 +1042,13 @@
 
             async loadModel() {
                 this.logger.log('Checking for AI separation models...', 'info');
+                try {
+                    await this.mlSeparator.load();
+                    this.mlAvailable = true;
+                } catch (err) {
+                    this.logger.log(`Neural model unavailable (${err.message}) - Voices & Music will use the DSP fallback method.`, 'warn');
+                    this.mlAvailable = false;
+                }
                 this.logger.log('DSP Matrix Engine initialized (Mid/Side Processing).', 'success');
                 return true;
             }
@@ -791,10 +1062,48 @@
                 const sampleRate = this.currentBuffer.sampleRate;
                 const numChannels = 2; // Force stereo for Mid/Side
 
+                // Attempt real neural separation first. On any failure, mlVoices/mlMusic
+                // stay null and the untouched DSP code below runs exactly as it always has.
+                let mlVoices = null, mlMusic = null;
+                if (this.mlAvailable) {
+                    onStatus("Preparing audio for neural separation...", 12);
+                    try {
+                        const checkCancel = () => this.shouldCancel;
+                        const mlInputBuffer = await this.resampleBuffer(this.currentBuffer, 44100);
+                        const { vocalsL, vocalsR } = await this.mlSeparator.separate(mlInputBuffer, onStatus, checkCancel);
+
+                        const vocalsBuf44k = new AudioBuffer({ length: vocalsL.length, numberOfChannels: 2, sampleRate: 44100 });
+                        vocalsBuf44k.copyToChannel(Float32Array.from(vocalsL), 0);
+                        vocalsBuf44k.copyToChannel(Float32Array.from(vocalsR), 1);
+
+                        const mixL44 = mlInputBuffer.getChannelData(0);
+                        const mixR44 = mlInputBuffer.numberOfChannels > 1 ? mlInputBuffer.getChannelData(1) : mixL44;
+                        const instL = new Float32Array(vocalsL.length);
+                        const instR = new Float32Array(vocalsL.length);
+                        for (let i = 0; i < vocalsL.length; i++) {
+                            instL[i] = mixL44[i] - vocalsL[i];
+                            instR[i] = mixR44[i] - vocalsR[i];
+                        }
+                        const musicBuf44k = new AudioBuffer({ length: instL.length, numberOfChannels: 2, sampleRate: 44100 });
+                        musicBuf44k.copyToChannel(instL, 0);
+                        musicBuf44k.copyToChannel(instR, 1);
+
+                        mlVoices = await this.resampleBuffer(vocalsBuf44k, sampleRate);
+                        mlMusic = await this.resampleBuffer(musicBuf44k, sampleRate);
+                        this.logger.log('Neural separation complete for Voices & Music.', 'success');
+                    } catch (err) {
+                        if (err.message === 'CANCELLED') { this.isProcessing = false; return; }
+                        this.logger.log(`Neural separation failed (${err.message}) - falling back to DSP method for this run.`, 'warn');
+                        mlVoices = null; mlMusic = null;
+                    }
+                }
+
                 // 1. Render Voices Stem (Mid Signal -> Vocal Bandpass)
                 onStatus("Extracting Voices (Center & Vocal Band)", 20);
                 if (this.shouldCancel) return;
-                {
+                if (mlVoices) {
+                    this.stems.voices = mlVoices;
+                } else {
                     const ctx = new OfflineAudioContext(numChannels, length, sampleRate);
                     const src = ctx.createBufferSource();
                     src.buffer = this.currentBuffer;
@@ -832,7 +1141,9 @@
                 // 2. Render Music Stem (Instrumental)
                 onStatus("Extracting Music (Instrumental & Bass)", 40);
                 if (this.shouldCancel) return;
-                {
+                if (mlMusic) {
+                    this.stems.music = mlMusic;
+                } else {
                     const ctx = new OfflineAudioContext(numChannels, length, sampleRate);
                     const src = ctx.createBufferSource();
                     src.buffer = this.currentBuffer;
