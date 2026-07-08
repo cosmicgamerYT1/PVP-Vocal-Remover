@@ -565,9 +565,14 @@
             measurementId: "G-GXWBQ5PN0D"
         };
 
-        firebase.initializeApp(firebaseConfig);
-        const db = firebase.database();
-        const analytics = firebase.analytics();
+        let db = null;
+        try {
+            firebase.initializeApp(firebaseConfig);
+            db = firebase.database();
+            firebase.analytics();
+        } catch (err) {
+            console.warn('Firebase unavailable (blocked or offline) - session logging disabled:', err.message);
+        }
 
         // Utility Classes
         class Logger {
@@ -591,6 +596,7 @@
             }
 
             startSession(fileName, fileSize) {
+                if (!this.db) return null;
                 this.sessionId = this.db.ref('processing_sessions').push().key;
                 const sessionData = {
                     fileName: fileName,
@@ -603,14 +609,14 @@
             }
 
             updateStatus(status, progress = null) {
-                if (!this.sessionId) return;
+                if (!this.db || !this.sessionId) return;
                 const updates = { status: status };
                 if (progress !== null) updates.progress = progress;
                 this.db.ref('processing_sessions/' + this.sessionId).update(updates);
             }
 
             logError(error) {
-                if (!this.sessionId) return;
+                if (!this.db || !this.sessionId) return;
                 this.db.ref('processing_sessions/' + this.sessionId).update({
                     status: 'ERROR',
                     error: error.message || String(error),
@@ -619,7 +625,7 @@
             }
 
             endSession(stemsCreated) {
-                if (!this.sessionId) return;
+                if (!this.db || !this.sessionId) return;
                 this.db.ref('processing_sessions/' + this.sessionId).update({
                     status: 'COMPLETED',
                     endTime: firebase.database.ServerValue.TIMESTAMP,
